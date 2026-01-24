@@ -6,6 +6,7 @@ import pickle
 from datetime import datetime
 
 import pandas as pd
+from scipy.stats import ks_2samp
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
@@ -61,6 +62,9 @@ def data_source():
 
 # Promotion rule
 ACCURACY_THRESHOLD = 0.80
+
+# KS test
+DRIFT_THRESHOLD = 0.05
 
 default_args = {
     "owner": "mlops",
@@ -149,14 +153,15 @@ with DAG(
 
 
     @task
-    def train_model(paths: dict) -> str:
+    def train_model(paths: dict, **context) -> str:
         """Train a logistic regression; log to MLflow; return model path."""
         ad = artifacts_dir()
         os.makedirs(ad, exist_ok=True)
         X_train = pd.read_parquet(paths["X_train"])
         y_train = pd.read_parquet(paths["y_train"])["target"]
 
-        with mlflow.start_run(run_name="xgb-train") as run:
+        with mlflow.start_run(run_name="xgb-train"):
+            mlflow.set_tag("pipeline_run_id", context["run_id"])
             params = {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.1, "subsample": 0.8, "random_state": 42,
                       "eval_metric": "logloss"}
             mlflow.log_params(params)
@@ -180,16 +185,51 @@ with DAG(
             # Log the serialized model as an artifact
             mlflow.log_artifact(model_path, artifact_path="model")
 
-            # Save run info for downstream tasks
-            meta_path = os.path.join(ad, "mlflow_run.json")
-            with open(meta_path, "w") as f:
-                json.dump({"run_id": run.info.run_id}, f)
-
         return model_path
 
 
     @task
-    def evaluate_model(paths: dict, model_path: str) -> dict:
+    def ks_drift(paths: dict, **context) -> dict:
+        ad = artifacts_dir()
+        os.makedirs(ad, exist_ok=True)
+
+        X_train = pd.read_parquet(paths["X_train"])
+        X_test = pd.read_parquet(paths["X_test"])
+
+        drift_report = {}
+        drift = False
+
+        for column in X_train.select_dtypes(include="number"):
+            stat, p_value = ks_2samp(
+                X_train[column].dropna(),
+                X_test[column].dropna()
+            )
+
+            drift_report[column] = {
+                "ks_statistic": float(stat),
+                "p_value": float(p_value),
+                "drift": int(p_value < DRIFT_THRESHOLD)
+            }
+
+            if p_value < DRIFT_THRESHOLD:
+                drift = True
+
+        report_path = os.path.join(ad, "drift_report.json")
+        with open(report_path, "w") as f:
+            json.dump(drift_report, f, indent=2)
+        with mlflow.start_run(run_name="ks_drift_check"):
+            mlflow.set_tag("pipeline_run_id", context["run_id"])
+            mlflow.log_artifact(report_path, artifact_path="drift_report")
+            mlflow.log_metric("drift", int(drift))
+
+        return {
+            "drift": drift,
+            "report": drift_report
+        }
+
+
+    @task
+    def evaluate_model(paths: dict, model_path: str, **context) -> dict:
         """Evaluate on test; log metrics to MLflow; return metrics dict."""
         ad = artifacts_dir()
         os.makedirs(ad, exist_ok=True)
@@ -202,10 +242,8 @@ with DAG(
         y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
 
-        # Log metric to the most recent run (by reading the run_id we wrote)
-        meta_path = os.path.join(ad, "mlflow_run.json")
-        run_id = json.load(open(meta_path))["run_id"]
-        with mlflow.start_run(run_id=run_id):
+        with mlflow.start_run(run_name="evaluation"):
+            mlflow.set_tag("pipeline_run_id", context["run_id"])
             mlflow.log_metric("accuracy", float(acc))
 
         metrics = {"accuracy": float(acc), "threshold": ACCURACY_THRESHOLD}
@@ -215,7 +253,7 @@ with DAG(
 
 
     @task
-    def promote_if_good(model_path: str, metrics: dict) -> str:
+    def promote_if_good(model_path: str, metrics: dict, drift: dict) -> str:
         """
         If model meets the accuracy threshold, "promote" it by copying into a
         simple filesystem registry with a versioned filename. Otherwise, skip.
@@ -223,6 +261,10 @@ with DAG(
         rd = registry_dir()
         os.makedirs(rd, exist_ok=True)
         acc = metrics["accuracy"]
+
+        if drift["drift"]:
+            raise AirflowSkipException("Data drift detected. Not promoting.")
+
         if acc < ACCURACY_THRESHOLD:
             # Skipping is nice to visualize in the UI as a yellow task
             raise AirflowSkipException(
@@ -240,5 +282,6 @@ with DAG(
     _report = validate_data(csv_path)
     splits = split_data(csv_path)
     model_path = train_model(splits)
+    drift = ks_drift(splits)
     metrics = evaluate_model(splits, model_path)
-    _maybe_promoted = promote_if_good(model_path, metrics)
+    _maybe_promoted = promote_if_good(model_path, metrics, drift)
