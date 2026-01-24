@@ -50,6 +50,8 @@ def mlflow_uri():
 mlflow.set_tracking_uri(mlflow_uri())
 mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT_NAME", "airflow-mlops-demo"))
 
+os.makedirs(base_dir(), exist_ok=True)
+
 
 # Simple dataset: UCI Heart Disease (cleaned subset via a raw GitHub URL)
 def data_source():
