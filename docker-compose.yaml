@@ -79,6 +79,8 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/mlops_demo:/opt/airflow/mlops_demo
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -332,6 +334,18 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.1
+    command: >
+      mlflow ui
+      --backend-store-uri file:///opt/airflow/mlops_demo/mlruns
+      --default-artifact-root file:///opt/airflow/mlops_demo/mlruns
+      --host 0.0.0.0
+      --port 5050
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/mlops_demo:/opt/airflow/mlops_demo
+    ports:
+      - "5050:5050"
 
 volumes:
   postgres-db-volume:
