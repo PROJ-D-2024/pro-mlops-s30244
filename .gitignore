@@ -209,3 +209,4 @@ __marimo__/
 .idea/
 airflow/logs
 airflow/data
+mlops_demo/
