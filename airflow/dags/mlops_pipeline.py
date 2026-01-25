@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import json
-import pickle
 from datetime import datetime
 
 import pandas as pd
+from mlflow import MlflowClient
+from mlflow.models import infer_signature
 from scipy.stats import ks_2samp
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -38,17 +39,13 @@ def artifacts_dir():
     return os.path.join(str(base_dir()), os.environ.get("ARTIFACTS_SUBDIR", "artifacts"))
 
 
-def registry_dir():
-    return os.path.join(str(base_dir()), os.environ.get("REGISTRY_SUBDIR", "registry"))
-
-
 # MOVE THESE
 # Local MLflow file store (no server required)
 def mlflow_uri():
     return f"file://{os.path.join(str(base_dir()), os.environ.get("MLRUNS_SUBDIR", "mlruns"))}"
 
 
-mlflow.set_tracking_uri(mlflow_uri())
+mlflow.set_tracking_uri(os.environ.get("MLFLOW_EXPERIMENT_URI", "http://mlflow:5050"))
 mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT_NAME", "airflow-mlops-demo"))
 
 os.makedirs(base_dir(), exist_ok=True)
@@ -153,14 +150,17 @@ with DAG(
 
 
     @task
-    def train_model(paths: dict, **context) -> str:
+    def train_model(paths: dict, **context) -> dict:
         """Train a logistic regression; log to MLflow; return model path."""
         ad = artifacts_dir()
         os.makedirs(ad, exist_ok=True)
         X_train = pd.read_parquet(paths["X_train"])
         y_train = pd.read_parquet(paths["y_train"])["target"]
 
-        with mlflow.start_run(run_name="xgb-train"):
+        signature = infer_signature(X_train, y_train)
+        input_example = X_train.iloc[:1]
+
+        with mlflow.start_run(run_name="mlops_pipeline") as run:
             mlflow.set_tag("pipeline_run_id", context["run_id"])
             params = {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.1, "subsample": 0.8, "random_state": 42,
                       "eval_metric": "logloss"}
@@ -169,9 +169,18 @@ with DAG(
             model = XGBClassifier(**params)
             model.fit(X_train, y_train)
 
-            model_path = os.path.join(ad, "model.pkl")
-            with open(model_path, "wb") as f:
-                pickle.dump(model, f)
+            model_name = "xgb"
+
+            mlflow.sklearn.log_model(
+                sk_model=model,
+                artifact_path="models",
+                registered_model_name=model_name,
+                signature=signature,
+                input_example=input_example
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_registered_model(model_name, "XGBoost classifier trained on UCI Heart Disease dataset.")
 
             feature_importance = pd.DataFrame({
                 "feature": X_train.columns,
@@ -182,14 +191,14 @@ with DAG(
 
             mlflow.log_artifact(feature_importance_path, artifact_path="feature_importance")
 
-            # Log the serialized model as an artifact
-            mlflow.log_artifact(model_path, artifact_path="model")
-
-        return model_path
+            return {
+                "run_id": run.info.run_id,
+                "model_name": model_name
+            }
 
 
     @task
-    def ks_drift(paths: dict, **context) -> dict:
+    def ks_drift(paths: dict, run_meta: dict, **context) -> dict:
         ad = artifacts_dir()
         os.makedirs(ad, exist_ok=True)
 
@@ -217,8 +226,8 @@ with DAG(
         report_path = os.path.join(ad, "drift_report.json")
         with open(report_path, "w") as f:
             json.dump(drift_report, f, indent=2)
-        with mlflow.start_run(run_name="ks_drift_check"):
-            mlflow.set_tag("pipeline_run_id", context["run_id"])
+        with mlflow.start_run(run_id=run_meta["run_id"]):
+            # mlflow.set_tag("pipeline_run_id", context["run_id"])
             mlflow.log_artifact(report_path, artifact_path="drift_report")
             mlflow.log_metric("drift", int(drift))
 
@@ -229,37 +238,27 @@ with DAG(
 
 
     @task
-    def evaluate_model(paths: dict, model_path: str, **context) -> dict:
+    def evaluate_model(paths: dict, run_meta: dict, **context) -> dict:
         """Evaluate on test; log metrics to MLflow; return metrics dict."""
-        ad = artifacts_dir()
-        os.makedirs(ad, exist_ok=True)
         X_test = pd.read_parquet(paths["X_test"])
         y_test = pd.read_parquet(paths["y_test"])["target"]
 
-        with open(model_path, "rb") as f:
-            model = pickle.load(f)
+        model_uri = f"models:/{run_meta["model_name"]}/None"
+        model = mlflow.sklearn.load_model(model_uri)
 
         y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
 
-        with mlflow.start_run(run_name="evaluation"):
-            mlflow.set_tag("pipeline_run_id", context["run_id"])
+        with mlflow.start_run(run_id=run_meta["run_id"]):
+            # mlflow.set_tag("pipeline_run_id", context["run_id"])
             mlflow.log_metric("accuracy", float(acc))
 
         metrics = {"accuracy": float(acc), "threshold": ACCURACY_THRESHOLD}
-        metrics_path = os.path.join(ad, "metrics.json")
-        json.dump(metrics, open(metrics_path, "w"), indent=2)
         return metrics
 
 
     @task
-    def promote_if_good(model_path: str, metrics: dict, drift: dict) -> str:
-        """
-        If model meets the accuracy threshold, "promote" it by copying into a
-        simple filesystem registry with a versioned filename. Otherwise, skip.
-        """
-        rd = registry_dir()
-        os.makedirs(rd, exist_ok=True)
+    def promote_if_good(metrics: dict, drift: dict, run_meta: dict) -> str:
         acc = metrics["accuracy"]
 
         if drift["drift"]:
@@ -271,17 +270,23 @@ with DAG(
                 f"Accuracy {acc:.3f} < threshold {ACCURACY_THRESHOLD:.3f}. Not promoting."
             )
 
-        version_tag = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        dest = os.path.join(rd, f"model_{version_tag}_acc{acc:.3f}.pkl")
-        with open(model_path, "rb") as src, open(dest, "wb") as dst:
-            dst.write(src.read())
-        return dest
+        client = MlflowClient()
+        model_name = run_meta["model_name"]
+
+        version = client.get_latest_versions(model_name, stages=["None"])[0]
+
+        client.transition_model_version_stage(
+            name=model_name,
+            version=version.version,
+            stage="Staging",
+            archive_existing_versions=True
+        )
 
 
     csv_path = ingest_data()
     _report = validate_data(csv_path)
     splits = split_data(csv_path)
-    model_path = train_model(splits)
-    drift = ks_drift(splits)
-    metrics = evaluate_model(splits, model_path)
-    _maybe_promoted = promote_if_good(model_path, metrics, drift)
+    run_meta = train_model(splits)
+    drift = ks_drift(splits, run_meta)
+    metrics = evaluate_model(splits, run_meta)
+    promote_if_good(metrics, drift, run_meta)
