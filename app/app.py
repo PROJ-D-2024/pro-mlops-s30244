@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 MODEL_NAME = os.getenv("MODEL_NAME", "xgb")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "champion")
-MLFLOW_URI = os.getenv("MLFLOW_EXPERIMENT_URI", "http://mlflow:5050")
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5050")
 
 mlflow.set_tracking_uri(MLFLOW_URI)
 

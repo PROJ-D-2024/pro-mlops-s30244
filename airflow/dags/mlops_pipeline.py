@@ -56,6 +56,11 @@ def data_source():
     return os.environ.get("DATA_SOURCE",
                           "https://raw.githubusercontent.com/nmiuddin/UCI-Heart-Disease-Dataset/refs/heads/master/data/heart-disease-UCI.csv")
 
+def production_alias():
+    return os.environ.get("PRODUCTION_ALIAS", "champion")
+
+def previous_alias():
+    return os.environ.get("PREVIOUS_ALIAS", "previous")
 
 # Promotion rule
 ACCURACY_THRESHOLD = 0.75
@@ -277,10 +282,10 @@ with DAG(
         new_version = run_meta["model_version"]
 
         try:
-            current = client.get_model_version_by_alias(model_name, "champion")
+            current = client.get_model_version_by_alias(model_name, production_alias())
             client.set_registered_model_alias(
                 name=model_name,
-                alias="previous",
+                alias=previous_alias(),
                 version=current.version
             )
         except:
@@ -288,7 +293,7 @@ with DAG(
 
         client.set_registered_model_alias(
             model_name,
-            "champion",
+            production_alias(),
             version=new_version
         )
 
