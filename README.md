@@ -6,9 +6,9 @@ This project implements an end-to-end MLOps pipeline for training, validating, d
 - FastAPI - model deployment
 
 ## Dataset
-Source: https://raw.githubusercontent.com/nmiuddin/UCI-Heart-Disease-Dataset/refs/heads/master/data/heart-disease-UCI.csv
-Size: 300 entries
-Description: the dataset contains records of clinical attributes of patients as well as their diagnosis (presence/absence of heart disease)
+- Source: https://raw.githubusercontent.com/nmiuddin/UCI-Heart-Disease-Dataset/refs/heads/master/data/heart-disease-UCI.csv
+- Size: 300 entries
+- Description: the dataset contains records of clinical attributes of patients as well as their diagnosis (presence/absence of heart disease)
 
 ## Pipeline
 **1. Data ingestion**
