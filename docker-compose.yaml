@@ -337,7 +337,7 @@ services:
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.12.1
     command: >
-      mlflow ui
+      mlflow server
       --backend-store-uri sqlite:///mlflow.db
       --default-artifact-root file:///opt/airflow/mlops_demo/mlruns
       --host 0.0.0.0
@@ -347,6 +347,21 @@ services:
       - ${AIRFLOW_PROJ_DIR:-.}/mlops_demo/mlflow.db:/opt/airflow/mlops_demo/mlflow.db
     ports:
       - "5050:5050"
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: app
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/mlops_demo:/opt/airflow/mlops_demo
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5050
+      MODEL_NAME: xgb
+      MODEL_STAGE: Production
+    depends_on:
+        - mlflow
 
 volumes:
   postgres-db-volume:

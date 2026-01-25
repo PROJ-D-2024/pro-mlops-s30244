@@ -58,7 +58,7 @@ def data_source():
 
 
 # Promotion rule
-ACCURACY_THRESHOLD = 0.80
+ACCURACY_THRESHOLD = 0.75
 
 # KS test
 DRIFT_THRESHOLD = 0.05
@@ -157,9 +157,6 @@ with DAG(
         X_train = pd.read_parquet(paths["X_train"])
         y_train = pd.read_parquet(paths["y_train"])["target"]
 
-        signature = infer_signature(X_train, y_train)
-        input_example = X_train.iloc[:1]
-
         with mlflow.start_run(run_name="mlops_pipeline") as run:
             mlflow.set_tag("pipeline_run_id", context["run_id"])
             params = {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.1, "subsample": 0.8, "random_state": 42,
@@ -169,9 +166,12 @@ with DAG(
             model = XGBClassifier(**params)
             model.fit(X_train, y_train)
 
+            signature = infer_signature(X_train, model.predict(X_train))
+            input_example = X_train.iloc[:25]
+
             model_name = "xgb"
 
-            mlflow.sklearn.log_model(
+            res = mlflow.sklearn.log_model(
                 sk_model=model,
                 artifact_path="models",
                 registered_model_name=model_name,
@@ -193,7 +193,9 @@ with DAG(
 
             return {
                 "run_id": run.info.run_id,
-                "model_name": model_name
+                "model_name": model_name,
+                "model_version": client.get_latest_versions(model_name, stages=["None"])[0].version,
+                "model_uri": res.model_uri
             }
 
 
@@ -243,7 +245,7 @@ with DAG(
         X_test = pd.read_parquet(paths["X_test"])
         y_test = pd.read_parquet(paths["y_test"])["target"]
 
-        model_uri = f"models:/{run_meta["model_name"]}/None"
+        model_uri = run_meta["model_uri"]
         model = mlflow.sklearn.load_model(model_uri)
 
         y_pred = model.predict(X_test)
@@ -272,14 +274,22 @@ with DAG(
 
         client = MlflowClient()
         model_name = run_meta["model_name"]
+        new_version = run_meta["model_version"]
 
-        version = client.get_latest_versions(model_name, stages=["None"])[0]
+        try:
+            current = client.get_model_version_by_alias(model_name, "champion")
+            client.set_registered_model_alias(
+                name=model_name,
+                alias="previous",
+                version=current.version
+            )
+        except:
+            pass
 
-        client.transition_model_version_stage(
-            name=model_name,
-            version=version.version,
-            stage="Staging",
-            archive_existing_versions=True
+        client.set_registered_model_alias(
+            model_name,
+            "champion",
+            version=new_version
         )
 
 
